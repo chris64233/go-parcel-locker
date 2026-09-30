@@ -86,6 +86,10 @@ type compartment struct {
 	id       string
 	size     Size
 	occupied bool // 是否正被某个预约占用
+	// occupantID 是当前占用者的预约 ID（fencing token）。占用与释放都
+	// 必须带预约身份校验：即便出现迟到的旧交接请求，也不可能释放后来
+	// 复用该格口的新预约。空闲时为空。
+	occupantID string
 }
 
 // reservation 是预约的运行时状态。凭证明文绝不落结构，只存摘要。
@@ -246,6 +250,7 @@ func (l *Locker) Reserve(req ReservationRequest) (*ReservationReceipt, error) {
 	ids := make([]string, 0, count)
 	for _, c := range candidates[:count] {
 		c.occupied = true
+		c.occupantID = id
 		ids = append(ids, c.id)
 	}
 
@@ -619,6 +624,10 @@ func (l *Locker) expireLocked(now time.Time) SweepResult {
 		res.ReleasedCompartments = append(res.ReleasedCompartments, r.compartmentIDs...)
 		l.expireReservationLocked(r, now)
 	}
+	// 返回顺序不依赖 map 遍历：两个列表分别按字典序排列，便于调用方
+	// 稳定地比较与记录批量回收结果。
+	sort.Strings(res.ExpiredReservations)
+	sort.Strings(res.ReleasedCompartments)
 	return res
 }
 
@@ -648,13 +657,16 @@ func (l *Locker) expireReservationLocked(r *reservation, now time.Time) {
 	})
 }
 
-// releaseCompartmentsLocked 只清除仍登记在该预约名下的格口占用。二次调用
-// （或对复用中的格口调用）不会把后来的预约误释放。
+// releaseCompartmentsLocked 只释放当前占用者仍为本预约的格口（fencing：
+// occupantID 必须匹配）。二次调用，或在格口已被后来的新预约复用时调用，
+// 都不会把新占用者误释放，因此“成功取件后格口只释放一次”不仅依赖状态机，
+// 也由格口占用身份直接保证。
 func (l *Locker) releaseCompartmentsLocked(r *reservation) {
 	for _, cid := range r.compartmentIDs {
 		c := l.compartments[cid]
-		if c != nil && c.occupied {
+		if c != nil && c.occupied && c.occupantID == r.id {
 			c.occupied = false
+			c.occupantID = ""
 		}
 	}
 }
